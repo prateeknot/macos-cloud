@@ -2,21 +2,33 @@ name: macOS desktop
 
 on:
   workflow_dispatch:
-    inputs:
-      vnc_password:
-        description: Password for the VNC connection and the macOS account
-        default: macvnc
-        required: false
+
+permissions:
+  contents: read
 
 jobs:
   desktop:
-    # Intel runner = 4 CPU / 14 GB RAM. The arm64 (M1) runners only get 7 GB.
-    runs-on: macos-15-intel
+    # Intel runner = 4 CPU / 14 GB RAM. The arm64 (M-series) runners only get 7 GB.
+    runs-on: macos-26-intel
     timeout-minutes: 355 # GitHub hard-caps a single job at 6 h
     env:
-      VNC_PW: ${{ inputs.vnc_password }}
+      # Repo secret. Keep it 8 characters or fewer: macOS legacy VNC auth (type 2)
+      # only reads the first 8. Same password unlocks the macOS login screen.
+      VNC_PW: ${{ secrets.VNC_PASSWORD }}
 
     steps:
+      - name: Check the password secret
+        run: |
+          if [ -z "$VNC_PW" ]; then
+            echo 'ERROR: repo secret VNC_PASSWORD is not set (Settings -> Secrets and variables -> Actions).'
+            exit 1
+          fi
+          if [ "${#VNC_PW}" -gt 8 ]; then
+            echo 'ERROR: VNC_PASSWORD must be 8 characters or fewer.'
+            exit 1
+          fi
+          echo 'VNC_PASSWORD is set.'
+
       - name: Create a local admin account
         # The pre-existing "runner" user has a SecureToken, so its password cannot
         # be reset from root. Make our own account instead.
@@ -42,15 +54,6 @@ jobs:
           # Some macOS builds ignore -setvncpw, so also write the obfuscated pref file.
           printf '%s' "$VNC_PW" | perl -we 'BEGIN { @k = unpack "C*", pack "H*", "1734516E8BA8C5E2FF1C39567390ADCA" }; $_ = <>; chomp; s/^(.{8}).*/$1/; @p = unpack "C*", $_; foreach (@k) { printf "%02X", $_ ^ (shift @p || 0) }; print "\n"' | sudo tee /Library/Preferences/com.apple.VNCSettings.txt
           sudo $K -restart -agent -console
-          # Give the headless VM a usable screen size; no-op if the tool is missing.
-          sudo "/Library/Application Support/VMware Tools/vmware-resolutionSet" 1920 1080 || true
-
-      - name: Serve the desktop in a browser, then hold the session open
-        run: |
-          python3 -m venv /tmp/wsv
-          /tmp/wsv/bin/pip install --quiet websockify
-          git clone --depth 1 https://github.com/novnc/noVNC.git /tmp/noVNC
-          nohup /tmp/wsv/bin/websockify --web /tmp/noVNC 6080 localhost:5900 > /tmp/websockify.log 2>&1 &
 
           # Prove the VNC server is really up before we bother tunnelling to it.
           python3 -c "
@@ -59,6 +62,16 @@ jobs:
           print('VNC server banner:', s.recv(12))
           "
 
+      - name: Serve the desktop in a browser, then hold the session open
+        run: |
+          # noVNC turns the VNC stream into a web page, so a browser is enough --
+          # no VNC client to install and no TCP tunnel that needs a paid account.
+          python3 -m venv /tmp/wsv
+          /tmp/wsv/bin/pip install --quiet websockify
+          git clone --depth 1 https://github.com/novnc/noVNC.git /tmp/noVNC
+          nohup /tmp/wsv/bin/websockify --web /tmp/noVNC 6080 localhost:5900 > /tmp/websockify.log 2>&1 &
+
+          # Cloudflare Tunnel quick tunnel: free, no account, no card, no token.
           brew install cloudflared
           nohup cloudflared tunnel --url http://localhost:6080 --no-autoupdate > /tmp/cloudflared.log 2>&1 &
           URL=""
@@ -69,13 +82,23 @@ jobs:
           done
           if [ -z "$URL" ]; then cat /tmp/cloudflared.log; exit 1; fi
 
+          # Host and user are safe to print -- they are session-specific. The password
+          # is NOT printed, so keep the repo secret somewhere you can paste it from.
           echo ""
           echo "=================================================================="
-          echo "  OPEN IN YOUR BROWSER:"
-          echo "  $URL/vnc.html?autoconnect=1&resize=scale&password=$VNC_PW"
+          echo "  YOUR TEMPORARY macOS DESKTOP IS READY"
           echo ""
-          echo "  When macOS asks you to log in:  user 'macuser'   password '$VNC_PW'"
+          echo "  VNC HOST : $URL"
+          echo "  VNC USER : macuser"
+          echo "  VNC PASS : (the VNC_PASSWORD repo secret -- not printed here)"
+          echo ""
+          echo "  OPEN THIS: $URL/vnc.html?autoconnect=1&resize=scale"
+          echo ""
+          echo "  At the macOS login screen use  macuser  +  your password."
           echo "=================================================================="
           echo ""
           echo "Session stays up ~5.5 h, or until you press 'Cancel workflow'."
+
+          # Hold the runner open. Add automatic stop is not possible here, so the job
+          # just sleeps; cloudflared/websockify keep running as background children.
           sleep 20000
