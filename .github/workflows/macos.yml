@@ -107,19 +107,13 @@ jobs:
           sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser macuser
           sudo defaults write /Library/Preferences/com.apple.loginwindow DisableFDEAutoLogin -bool false || true
 
-          # Restart loginwindow so auto-login happens NOW, not on next boot.
-          # The Actions runner itself runs as a launchd service, so killing the
-          # console session does not kill the job.
-          sudo killall -HUP loginwindow 2>/dev/null || true
-          sleep 15
-
-          # Prove the console session now belongs to macuser.
-          for _ in $(seq 1 12); do
-            CU="$(stat -f%Su /dev/console)"
-            [ "$CU" = "macuser" ] && break
-            sleep 5
-          done
-          echo "console user is now: $(stat -f%Su /dev/console)"
+          # NOTE: do NOT restart loginwindow here. The Actions runner service is a
+          # LaunchAgent inside the runner user's GUI session -- restarting the
+          # loginwindow logs that session out and kills the job (exit 143).
+          # autoLoginUser takes effect on the next loginwindow start; the console
+          # session that exists right now already belongs to "runner" and is the
+          # desktop VNC shares, which is all we need.
+          echo "console user right now: $(stat -f%Su /dev/console)"
 
       - name: Capture display and session diagnostics
         # When the desktop comes up blank these are the facts that say why, so they get
@@ -146,6 +140,75 @@ jobs:
           /tmp/wsv/bin/pip install --quiet websockify
           git clone --depth 1 https://github.com/novnc/noVNC.git /tmp/noVNC
           brew install cloudflared
+
+      - name: Capture what VNC actually streams
+        # Ground truth for the black screen: this logs into the local VNC server
+        # exactly like a client, grabs one full framebuffer update and saves it
+        # as an artifact. If the image is black, the problem is the console
+        # session; if it shows a desktop, the problem is tunnel/client side.
+        run: |
+          /tmp/wsv/bin/pip install --quiet pyDes pillow
+          cat > /tmp/grabframe.py <<'PY'
+          import os, socket, struct, sys
+          import pyDes
+          from PIL import Image
+
+          pw = os.environ['VNC_PW'][:8].ljust(8, '\x00').encode()
+          s = socket.create_connection(('127.0.0.1', 5900), 10)
+          print('server:', s.recv(12))
+          s.sendall(b'RFB 003.008\n')
+          n = s.recv(1)[0]
+          types = s.recv(n)
+          print('security types:', list(types))
+          if 2 not in types:
+              print('NO legacy VNC auth offered'); sys.exit(0)
+          s.sendall(bytes([2]))
+          challenge = s.recv(16)
+          key = bytes(int(f'{b:08b}'[::-1], 2) for b in pw[:8])
+          s.sendall(pyDes.des(key, padmode=pyDes.PAD_NORMAL).encrypt(challenge))
+          result = struct.unpack('>I', s.recv(4))[0]
+          print('auth result:', result, '(0 = ok)')
+          if result != 0:
+              sys.exit(0)
+          s.sendall(bytes([1]))  # shared session
+          data = b''
+          while len(data) < 24:
+              data += s.recv(24 - len(data))
+          w, h = struct.unpack('>HH', data[:4])
+          namelen = struct.unpack('>I', data[20:24])[0]
+          name = b''
+          while len(name) < namelen:
+              name += s.recv(namelen - len(name))
+          print('framebuffer:', w, 'x', h, '| name:', name.decode(errors='replace'))
+          s.sendall(struct.pack('>BxH', 2, 1) + struct.pack('>i', 0))  # raw encoding
+          s.sendall(struct.pack('>BBHHH', 3, 0, 0, 0, w, h))           # full update request
+          hdr = b''
+          while len(hdr) < 6:
+              hdr += s.recv(6 - len(hdr))
+          if hdr[0] != 0:
+              print('expected framebuffer update, got message type', hdr[0]); sys.exit(0)
+          nrects = struct.unpack('>H', hdr[4:6])[0]
+          print('rects:', nrects)
+          pixels = bytearray()
+          for _ in range(nrects):
+              r = b''
+              while len(r) < 12:
+                  r += s.recv(12 - len(r))
+              x, y, rw, rh = struct.unpack('>HHHH', r[:8])
+              enc = struct.unpack('>i', r[8:12])[0]
+              if enc != 0:
+                  print('non-raw encoding:', enc); sys.exit(0)
+              nbytes = rw * rh * 4
+              d = b''
+              while len(d) < nbytes:
+                  d += s.recv(nbytes - len(d))
+              pixels.extend(d)
+          img = Image.frombytes('RGBX', (w, h), bytes(pixels)).convert('RGB')
+          img.save('/tmp/vnc-frame.png')
+          hist = img.convert('L').histogram()
+          print(f'black pixel share: {hist[0] / sum(hist) * 100:.1f}%')
+          PY
+          /tmp/wsv/bin/python /tmp/grabframe.py || echo 'frame grab failed (non-fatal)'
 
       - name: Start the desktop and the tunnel in the system domain
         # launchctl submit registers the jobs with the SYSTEM launchd, not the
@@ -251,6 +314,7 @@ jobs:
           path: |
             /tmp/vnc-info.txt
             /tmp/diagnostics.txt
+            /tmp/vnc-frame.png
           retention-days: 1
 
       - name: Keep the desktop alive and re-print the URL
