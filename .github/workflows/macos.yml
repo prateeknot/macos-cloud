@@ -42,6 +42,8 @@ jobs:
           sudo dscl . -passwd /Users/macuser "$VNC_PW"
           sudo createhomedir -c -u macuser > /dev/null
           sudo mdutil -i off -a # stop Spotlight from hammering a slow VM
+          # A sleeping display on a headless VM streams as a black screen with a cursor.
+          sudo pmset -a sleep 0 displaysleep 0 disksleep 0 || true
 
       - name: Enable the built-in VNC server
         # "legacy" password auth is required: noVNC speaks plain VNC auth (type 2),
@@ -68,6 +70,21 @@ jobs:
           print('VNC server banner:', s.recv(12))
           "
 
+      - name: Capture display and session diagnostics
+        # When the desktop comes up blank these are the facts that say why, so they get
+        # captured before anyone logs in and published next to the connection link.
+        run: |
+          {
+            echo '== console user =='; stat -f%Su /dev/console
+            echo; echo '== pmset =='; sudo pmset -g
+            echo; echo '== displays =='; system_profiler SPDisplaysDataType | head -50
+            echo; echo '== session processes =='
+            ps -ef | grep -iE 'ARDAgent|WindowServer|screensharingd|loginwindow' | grep -v grep
+            echo; echo '== display sleep assertions =='
+            pmset -g assertions | head -20
+          } > /tmp/diagnostics.txt 2>&1
+          cat /tmp/diagnostics.txt
+
       - name: Install noVNC and cloudflared
         run: |
           python3 -m venv /tmp/wsv
@@ -92,6 +109,32 @@ jobs:
           sudo launchctl submit -l com.macoscloud.tunnel \
             -o /tmp/tunnel.log -e /tmp/tunnel.err \
             -- "$CF" tunnel --url http://localhost:6080 --no-autoupdate
+
+          # Never let the display sleep, and re-attach the VNC agent whenever the console
+          # user changes. Logging in switches the session; without this the agent keeps
+          # streaming the old one and the client shows a cursor on an empty desktop.
+          sudo launchctl submit -l com.macoscloud.keepawake \
+            -o /tmp/keepawake.log -e /tmp/keepawake.err \
+            -- /usr/bin/caffeinate -dimsu
+
+          cat > /tmp/reconnect.sh <<'SH'
+          #!/bin/bash
+          K=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
+          LAST="$(stat -f%Su /dev/console)"
+          while true; do
+            NOW="$(stat -f%Su /dev/console)"
+            if [ "$NOW" != "$LAST" ]; then
+              echo "$(date -u '+%F %T') console user $LAST -> $NOW, re-attaching the VNC agent"
+              "$K" -restart -agent -console || true
+              LAST="$NOW"
+            fi
+            sleep 5
+          done
+          SH
+          chmod +x /tmp/reconnect.sh
+          sudo launchctl submit -l com.macoscloud.reconnect \
+            -o /tmp/reconnect.log -e /tmp/reconnect.err \
+            -- /tmp/reconnect.sh
 
           URL=""
           for _ in $(seq 1 60); do
@@ -139,7 +182,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: vnc-connection
-          path: /tmp/vnc-info.txt
+          path: |
+            /tmp/vnc-info.txt
+            /tmp/diagnostics.txt
           retention-days: 1
 
       - name: Keep the desktop alive and re-print the URL
