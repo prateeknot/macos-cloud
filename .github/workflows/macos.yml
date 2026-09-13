@@ -127,6 +127,20 @@ jobs:
           echo "=================================================================="
           echo ""
 
+          # Also leave the link in a file so it can be published as an artifact.
+          { echo "URL  : $URL/vnc.html?autoconnect=1&resize=scale"
+            echo "USER : macuser"
+            echo "PASS : the VNC_PASSWORD repo secret"; } > /tmp/vnc-info.txt
+
+      - name: Publish the connection link as an artifact
+        # So the URL can be fetched without scraping the log. Never fatal.
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: vnc-connection
+          path: /tmp/vnc-info.txt
+          retention-days: 1
+
       - name: Keep the desktop alive and re-print the URL
         run: |
           echo 'Desktop stays online until you cancel the workflow, or until the job hits its 355-minute cap.'
