@@ -1,0 +1,151 @@
+name: macOS Cloud VNC
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  macos-vnc:
+    # Current standard Intel macOS runner: 4 CPU / 14 GB RAM.
+    runs-on: macos-26-intel
+    timeout-minutes: 350
+
+    steps:
+      - name: Validate required secrets
+        env:
+          NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+          VNC_USER_PASSWORD: ${{ secrets.VNC_USER_PASSWORD }}
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          [[ -n "$NGROK_AUTH_TOKEN" ]] || { echo 'ERROR: NGROK_AUTH_TOKEN secret is missing.'; exit 1; }
+          [[ -n "$VNC_USER_PASSWORD" ]] || { echo 'ERROR: VNC_USER_PASSWORD secret is missing.'; exit 1; }
+          [[ -n "$VNC_PASSWORD" ]] || { echo 'ERROR: VNC_PASSWORD secret is missing.'; exit 1; }
+          if (( ${#VNC_PASSWORD} > 8 )); then
+            echo 'ERROR: VNC_PASSWORD must be 8 characters or fewer for the legacy VNC password format.'
+            exit 1
+          fi
+
+      - name: Prepare macOS GUI and VNC
+        env:
+          VNC_USER_PASSWORD: ${{ secrets.VNC_USER_PASSWORD }}
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          echo 'Preparing temporary macOS desktop...'
+          sudo pmset -a sleep 0 displaysleep 0 disksleep 0 || true
+          sudo mdutil -i off -a || true
+
+          # Create a dedicated local account. We do not touch the GitHub runner account.
+          if ! id vncuser >/dev/null 2>&1; then
+            LAST_UID="$(dscl . -list /Users UniqueID | awk '$2 >= 500 {print $2}' | sort -n | tail -1)"
+            NEXT_UID=$((LAST_UID + 1))
+            sudo dscl . -create /Users/vncuser
+            sudo dscl . -create /Users/vncuser UserShell /bin/bash
+            sudo dscl . -create /Users/vncuser RealName 'VNC User'
+            sudo dscl . -create /Users/vncuser UniqueID "$NEXT_UID"
+            sudo dscl . -create /Users/vncuser PrimaryGroupID 20
+            sudo dscl . -create /Users/vncuser NFSHomeDirectory /Users/vncuser
+            sudo dscl . -passwd /Users/vncuser "$VNC_USER_PASSWORD"
+            sudo createhomedir -c -u vncuser >/dev/null
+            sudo dscl . -append /Groups/admin GroupMembership vncuser
+          fi
+
+          # Enable Apple's built-in Remote Management / Screen Sharing agent.
+          KICKSTART='/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart'
+          if [[ ! -x "$KICKSTART" ]]; then
+            echo 'ERROR: macOS RemoteManagement kickstart tool is unavailable on this runner image.'
+            exit 1
+          fi
+
+          sudo "$KICKSTART" -configure -allowAccessFor -allUsers -privs -all
+          sudo "$KICKSTART" -configure -clientopts -setvnclegacy -vnclegacy yes
+
+          # Legacy VNC password is limited to 8 characters. Apple Screen Sharing can instead
+          # authenticate with vncuser + VNC_USER_PASSWORD.
+          printf '%s\n' "$VNC_PASSWORD" | perl -we 'BEGIN { @k = unpack "C*", pack "H*", "1734516E8BA8C5E2FF1C39567390ADCA"}; $_ = <>; chomp; s/^(.{8}).*/$1/; @p = unpack "C*", $_; foreach (@k) { printf "%02X", $_ ^ (shift @p || 0) }; print "\n"' | sudo tee /Library/Preferences/com.apple.VNCSettings.txt >/dev/null
+
+          sudo "$KICKSTART" -restart -agent -console
+          sudo "$KICKSTART" -activate
+
+          # Confirm something is listening on the VNC port.
+          for i in {1..20}; do
+            if nc -z 127.0.0.1 5900; then
+              echo 'VNC is listening on 127.0.0.1:5900.'
+              break
+            fi
+            sleep 2
+          done
+          nc -z 127.0.0.1 5900 || { echo 'ERROR: VNC port 5900 did not open.'; exit 1; }
+
+      - name: Install and start ngrok TCP tunnel
+        env:
+          NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if ! command -v ngrok >/dev/null 2>&1; then
+            brew install --cask ngrok
+          fi
+
+          ngrok config add-authtoken "$NGROK_AUTH_TOKEN"
+          nohup ngrok tcp 5900 --log=stdout >/tmp/ngrok.log 2>&1 &
+          NGROK_PID=$!
+          echo "$NGROK_PID" >/tmp/ngrok.pid
+
+          echo 'Waiting for ngrok TCP tunnel...'
+          TUNNEL=''
+          for i in {1..30}; do
+            TUNNEL="$(curl -fsS http://127.0.0.1:4040/api/tunnels 2>/dev/null | jq -r '.tunnels[0].public_url // empty' || true)"
+            if [[ "$TUNNEL" == tcp://* ]]; then
+              break
+            fi
+            sleep 2
+          done
+
+          if [[ "$TUNNEL" != tcp://* ]]; then
+            echo 'ERROR: ngrok tunnel did not start.'
+            echo '--- ngrok log ---'
+            cat /tmp/ngrok.log || true
+            exit 1
+          fi
+
+          ENDPOINT="${TUNNEL#tcp://}"
+          HOST="${ENDPOINT%:*}"
+          PORT="${ENDPOINT##*:}"
+
+          echo ''
+          echo '============================================================'
+          echo '            YOUR TEMPORARY macOS DESKTOP IS READY'
+          echo '============================================================'
+          echo "VNC HOST : $HOST"
+          echo "VNC PORT : $PORT"
+          echo 'USERNAME : vncuser'
+          echo 'PASSWORD : the value you put in VNC_USER_PASSWORD'
+          echo '------------------------------------------------------------'
+          echo 'Use a VNC client on Windows and connect to HOST:PORT.'
+          echo 'Apple Screen Sharing / RealVNC should use vncuser + VNC_USER_PASSWORD.'
+          echo 'The VNC-only password is kept only for legacy VNC clients.'
+          echo '============================================================'
+          echo ''
+
+      - name: Keep the macOS desktop alive
+        run: |
+          set -euo pipefail
+          echo 'macOS desktop will remain online until the workflow is cancelled or times out.'
+          echo 'If you disconnect VNC, the Mac stays alive.'
+          while true; do
+            if [[ -f /tmp/ngrok.pid ]] && ! kill -0 "$(cat /tmp/ngrok.pid)" 2>/dev/null; then
+              echo 'ERROR: ngrok stopped unexpectedly.'
+              cat /tmp/ngrok.log || true
+              exit 1
+            fi
+            sleep 30
+          done
