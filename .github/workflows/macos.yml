@@ -83,6 +83,44 @@ jobs:
           print('VNC server banner:', s.recv(12))
           "
 
+      - name: Auto-login macuser at the console
+        # THE black-screen fix. On a headless VM the console sits at the login
+        # window (or a locked session) and Screen Sharing streams that empty
+        # framebuffer: the client shows black with only its own cursor. Logging
+        # in THROUGH VNC switches the console session and the agent keeps
+        # streaming the old one. So we make macOS auto-login macuser at boot /
+        # whenever loginwindow restarts, so the console session is always a
+        # real desktop we can share.
+        run: |
+          # Encode the password in macOS's kcpassword format (fixed XOR key).
+          python3 - <<'PY'
+          import os
+          pw = os.environ['VNC_PW'].encode() + b'\x00'
+          key = bytes([0x7D,0x89,0x52,0x23,0xD2,0xBC,0xDD,0xEA,0xA3,0xB3,0x84,0x55])
+          while len(pw) % 12:
+              pw += b'\x00'
+          open('/tmp/kcpassword','wb').write(bytes(b ^ key[i % len(key)] for i, b in enumerate(pw)))
+          PY
+          sudo mv /tmp/kcpassword /etc/kcpassword
+          sudo chown root:wheel /etc/kcpassword
+          sudo chmod 600 /etc/kcpassword
+          sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser macuser
+          sudo defaults write /Library/Preferences/com.apple.loginwindow DisableFDEAutoLogin -bool false || true
+
+          # Restart loginwindow so auto-login happens NOW, not on next boot.
+          # The Actions runner itself runs as a launchd service, so killing the
+          # console session does not kill the job.
+          sudo killall -HUP loginwindow 2>/dev/null || true
+          sleep 15
+
+          # Prove the console session now belongs to macuser.
+          for _ in $(seq 1 12); do
+            CU="$(stat -f%Su /dev/console)"
+            [ "$CU" = "macuser" ] && break
+            sleep 5
+          done
+          echo "console user is now: $(stat -f%Su /dev/console)"
+
       - name: Capture display and session diagnostics
         # When the desktop comes up blank these are the facts that say why, so they get
         # captured before anyone logs in and published next to the connection link.
@@ -194,9 +232,8 @@ jobs:
           echo ""
           echo "  OPEN THIS: $URL/vnc.html?autoconnect=1&resize=scale"
           echo ""
-          echo "  At the macOS login screen use  macuser  +  your password."
-          echo "  If the desktop comes up BLACK: reload the page. Logging in switches"
-          echo "  the console session, and the first frame after the switch is often empty."
+          echo "  macuser is auto-logged-in at the console, so you should land"
+          echo "  straight on the desktop. If it is ever black: reload the page."
           echo "=================================================================="
           echo ""
 
