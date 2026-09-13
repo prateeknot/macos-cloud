@@ -95,7 +95,8 @@ jobs:
 
           URL=""
           for _ in $(seq 1 60); do
-            URL=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/tunnel.log 2>/dev/null | head -1 || true)
+            # cloudflared logs the URL on stderr, so search both streams.
+            URL=$(grep -hoE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/tunnel.log /tmp/tunnel.err 2>/dev/null | head -1 || true)
             [ -n "$URL" ] && break
             sleep 5
           done
@@ -146,5 +147,5 @@ jobs:
           echo 'Desktop stays online until you cancel the workflow, or until the job hits its 355-minute cap.'
           while true; do
             sleep 1800
-            echo "--- $(date -u '+%H:%M UTC') still alive. URL: $(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/tunnel.log 2>/dev/null | head -1) ---"
+            echo "--- $(date -u '+%H:%M UTC') still alive. URL: $(grep -hoE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/tunnel.log /tmp/tunnel.err 2>/dev/null | head -1) ---"
           done
