@@ -42,8 +42,21 @@ jobs:
           sudo dscl . -passwd /Users/macuser "$VNC_PW"
           sudo createhomedir -c -u macuser > /dev/null
           sudo mdutil -i off -a # stop Spotlight from hammering a slow VM
-          # A sleeping display on a headless VM streams as a black screen with a cursor.
+
+          # THE important part on a headless VM. The runner has an emulated display and
+          # no way to wake it again, so once it sleeps Screen Sharing streams an empty
+          # framebuffer: the client shows a black desktop with only its own cursor dot,
+          # then drops the connection. Stop the display sleeping and stop the screen
+          # locking, so the console session can simply be shared.
           sudo pmset -a sleep 0 displaysleep 0 disksleep 0 || true
+          sudo defaults write /Library/Preferences/com.apple.screensaver askForPassword -int 0 || true
+          sudo defaults write /Library/Preferences/com.apple.screensaver askForPasswordDelay -int 0 || true
+          sudo defaults write /Library/Preferences/com.apple.loginwindow DisableScreenLock -bool true || true
+          sudo defaults write /Library/Preferences/com.apple.loginwindow loginwindowIdleTime -int 0 || true
+
+          # Wake whatever the console is showing right now (locked screen or login window).
+          sudo killall ScreenSaverEngine 2>/dev/null || true
+          caffeinate -u -t 2 || true
 
       - name: Enable the built-in VNC server
         # "legacy" password auth is required: noVNC speaks plain VNC auth (type 2),
@@ -82,6 +95,10 @@ jobs:
             ps -ef | grep -iE 'ARDAgent|WindowServer|screensharingd|loginwindow' | grep -v grep
             echo; echo '== display sleep assertions =='
             pmset -g assertions | head -20
+            echo; echo '== lock / screensaver prefs =='
+            defaults read /Library/Preferences/com.apple.screensaver 2>/dev/null || true
+            echo; echo '== displayplacer =='
+            displayplacer list 2>&1 | head -25 || true
           } > /tmp/diagnostics.txt 2>&1
           cat /tmp/diagnostics.txt
 
@@ -119,16 +136,28 @@ jobs:
 
           cat > /tmp/reconnect.sh <<'SH'
           #!/bin/bash
+          # Keeps a headless VM awake and re-attaches the VNC agent when the console
+          # session changes (logging in switches it, which used to leave the agent
+          # streaming the previous session).
           K=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
-          LAST="$(stat -f%Su /dev/console)"
+          LAST=''
           while true; do
             NOW="$(stat -f%Su /dev/console)"
             if [ "$NOW" != "$LAST" ]; then
-              echo "$(date -u '+%F %T') console user $LAST -> $NOW, re-attaching the VNC agent"
+              echo "$(date -u '+%F %T') console user -> $NOW; refreshing display and VNC agent"
+              UID_NOW="$(id -u "$NOW" 2>/dev/null || true)"
+              if [ -n "$UID_NOW" ]; then
+                launchctl asuser "$UID_NOW" caffeinate -u -t 2 >/dev/null 2>&1 || true
+                if command -v displayplacer >/dev/null 2>&1; then
+                  launchctl asuser "$UID_NOW" displayplacer list >/tmp/displayplacer.log 2>&1 || true
+                fi
+              fi
               "$K" -restart -agent -console || true
               LAST="$NOW"
             fi
-            sleep 5
+            # Nudge the emulated display awake so it never blanks out.
+            caffeinate -u -t 1 >/dev/null 2>&1 || true
+            sleep 20
           done
           SH
           chmod +x /tmp/reconnect.sh
