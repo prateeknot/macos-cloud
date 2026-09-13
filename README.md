@@ -32,6 +32,17 @@ method on file for TCP endpoints, and Cloudflare quick tunnels need no account a
 
 Only works while the job runs. Nothing persists between runs.
 
+## If it breaks
+
+- **Desktop is black after you log in.** Logging in switches the console session, and the
+  first frame after that switch is often empty on a headless VM. **Reload the page** — that
+  re-attaches to the session that is now active.
+- **`Cloudflare Tunnel error 1033`.** The tunnel lost its connection to Cloudflare's edge.
+  The browser and tunnel now run as system-domain launchd jobs (`launchctl submit`), so they
+  survive session switches and restarts. Reload; if it stays down, start a fresh run.
+- **Lost the URL.** It is re-printed in the log every 30 minutes by the keep-alive step, so
+  just open the running job again.
+
 ## What you get
 
 | | |

@@ -53,6 +53,12 @@ jobs:
           sudo $K -configure -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$VNC_PW"
           # Some macOS builds ignore -setvncpw, so also write the obfuscated pref file.
           printf '%s' "$VNC_PW" | perl -we 'BEGIN { @k = unpack "C*", pack "H*", "1734516E8BA8C5E2FF1C39567390ADCA" }; $_ = <>; chomp; s/^(.{8}).*/$1/; @p = unpack "C*", $_; foreach (@k) { printf "%02X", $_ ^ (shift @p || 0) }; print "\n"' | sudo tee /Library/Preferences/com.apple.VNCSettings.txt
+
+          # The VM has no real monitor. Without a forced mode the shared screen has no
+          # framebuffer and every VNC client shows plain black. Best effort, ignored if
+          # this runner image ships no VMware tools.
+          sudo "/Library/Application Support/VMware Tools/vmware-resolutionSet" 1920 1080 || true
+
           sudo $K -restart -agent -console
 
           # Prove the VNC server is really up before we bother tunnelling to it.
@@ -62,25 +68,46 @@ jobs:
           print('VNC server banner:', s.recv(12))
           "
 
-      - name: Serve the desktop in a browser, then hold the session open
+      - name: Install noVNC and cloudflared
         run: |
-          # noVNC turns the VNC stream into a web page, so a browser is enough --
-          # no VNC client to install and no TCP tunnel that needs a paid account.
           python3 -m venv /tmp/wsv
           /tmp/wsv/bin/pip install --quiet websockify
           git clone --depth 1 https://github.com/novnc/noVNC.git /tmp/noVNC
-          nohup /tmp/wsv/bin/websockify --web /tmp/noVNC 6080 localhost:5900 > /tmp/websockify.log 2>&1 &
-
-          # Cloudflare Tunnel quick tunnel: free, no account, no card, no token.
           brew install cloudflared
-          nohup cloudflared tunnel --url http://localhost:6080 --no-autoupdate > /tmp/cloudflared.log 2>&1 &
+
+      - name: Start the desktop and the tunnel in the system domain
+        # launchctl submit registers the jobs with the SYSTEM launchd, not the
+        # "runner" user's session. That matters: logging in as macuser switches the
+        # console session, and anything started with plain nohup dies with it, which
+        # is what produced "Cloudflare Tunnel error 1033" and the black screen.
+        run: |
+          CF="$(command -v cloudflared)"
+          sudo launchctl remove com.macoscloud.websockify 2>/dev/null || true
+          sudo launchctl remove com.macoscloud.tunnel 2>/dev/null || true
+
+          sudo launchctl submit -l com.macoscloud.websockify \
+            -o /tmp/websockify.log -e /tmp/websockify.err \
+            -- /tmp/wsv/bin/websockify --web /tmp/noVNC 6080 localhost:5900
+
+          sudo launchctl submit -l com.macoscloud.tunnel \
+            -o /tmp/tunnel.log -e /tmp/tunnel.err \
+            -- "$CF" tunnel --url http://localhost:6080 --no-autoupdate
+
           URL=""
           for _ in $(seq 1 60); do
-            URL=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1 || true)
+            URL=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/tunnel.log 2>/dev/null | head -1 || true)
             [ -n "$URL" ] && break
             sleep 5
           done
-          if [ -z "$URL" ]; then cat /tmp/cloudflared.log; exit 1; fi
+          if [ -z "$URL" ]; then cat /tmp/tunnel.log /tmp/tunnel.err; exit 1; fi
+
+          # The tunnel can answer before websockify has finished binding 6080.
+          for _ in $(seq 1 20); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$URL/vnc.html" || true)
+            [ "$code" = "200" ] && break
+            sleep 3
+          done
+          echo "noVNC HTTP status: ${code:-none}"
 
           # Host and user are safe to print -- they are session-specific. The password
           # is NOT printed, so keep the repo secret somewhere you can paste it from.
@@ -95,10 +122,15 @@ jobs:
           echo "  OPEN THIS: $URL/vnc.html?autoconnect=1&resize=scale"
           echo ""
           echo "  At the macOS login screen use  macuser  +  your password."
+          echo "  If the desktop comes up BLACK: reload the page. Logging in switches"
+          echo "  the console session, and the first frame after the switch is often empty."
           echo "=================================================================="
           echo ""
-          echo "Session stays up ~5.5 h, or until you press 'Cancel workflow'."
 
-          # Hold the runner open. Add automatic stop is not possible here, so the job
-          # just sleeps; cloudflared/websockify keep running as background children.
-          sleep 20000
+      - name: Keep the desktop alive and re-print the URL
+        run: |
+          echo 'Desktop stays online until you cancel the workflow, or until the job hits its 355-minute cap.'
+          while true; do
+            sleep 1800
+            echo "--- $(date -u '+%H:%M UTC') still alive. URL: $(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/tunnel.log 2>/dev/null | head -1) ---"
+          done
